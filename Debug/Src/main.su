@@ -1,0 +1,17 @@
+core_cm4.h:2064:26:ITM_SendChar	16	static,ignoring_inline_asm
+main.c:23:5:_write	32	static
+main.c:94:6:Change_State	16	static
+main.c:103:6:Set_Fault	16	static
+main.c:112:6:Add_Event_Log	24	static
+main.c:126:13:Get_Fault_String	16	static
+main.c:148:6:Set_Fan_Speed	24	static
+main.c:205:7:Get_System_Temperature	32	static
+main.c:242:6:Thermal_Management	16	static
+main.c:308:5:main	48	static
+main.c:523:6:SystemClock_Config	104	static
+main.c:574:13:MX_I2C1_Init	8	static
+main.c:608:13:MX_I2S3_Init	8	static
+main.c:642:13:MX_SPI1_Init	8	static
+main.c:680:13:MX_TIM1_Init	80	static
+main.c:745:13:MX_GPIO_Init	56	static
+main.c:840:6:Error_Handler	4	static
