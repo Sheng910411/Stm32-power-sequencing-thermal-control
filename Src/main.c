@@ -1,865 +1,1247 @@
+/* =========================================================================
+ * STM32F407VG Embedded Power Sequencing and Thermal Management System
+ * -------------------------------------------------------------------------
+ * Board  : STM32F4DISCOVERY / STM32F407VG
+ * Author : Jiang Jia-Sheng
+ *
+ * -------------------------------------------------------------------------
+ * PROJECT SCOPE
+ * -------------------------------------------------------------------------
+ * In a real server, rail sequencing is usually executed by a CPLD or a
+ * dedicated power sequencer IC, while the BMC supervises the process:
+ * it verifies that the sequence completes, declares a fault on timeout,
+ * records events, and manages cooling.
+ *
+ * This project models the supervising side. The power rails are NOT
+ * physically controlled by the STM32; PB0 / PB1 / PB2 are used to simulate
+ * Power-Good feedback signals from three rails.
+ *
+ * -------------------------------------------------------------------------
+ * FUNCTIONS
+ * -------------------------------------------------------------------------
+ * 1. GPIO
+ *      PA0  : Power button
+ *      PB0  : 3.3V  Power-Good input (simulated)
+ *      PB1  : 12V   Power-Good input (simulated)
+ *      PB2  : VCORE Power-Good input (simulated)
+ *      PE8  : Green  LED  (fan off)
+ *      PE10 : Yellow LED  (fan mid)
+ *      PE12 : Red    LED  (fan high / fault)
+ *
+ * 2. Power Sequence
+ *      Verify Power-Good in the order 3.3V -> 12V -> VCORE.
+ *      Each step has timeout protection.
+ *
+ * 3. I2C Temperature Monitoring
+ *      LM75A digital temperature sensor with a retry mechanism.
+ *
+ * 4. PWM Fan Control
+ *      TIM1 CH1 (PE9) -> L9110 H-bridge driver -> DC fan.
+ *      Three fan levels with temperature hysteresis.
+ *
+ * 5. Fault Handling
+ *      Fault codes, circular event log, LED indication,
+ *      and thermal fail-safe behaviour.
+ *
+ * -------------------------------------------------------------------------
+ * FAN WIRING (L9110 H-bridge module)
+ * -------------------------------------------------------------------------
+ *      Module INA  <---- PE9  (TIM1_CH1 PWM output)
+ *      Module INB  <---- GND        <-- must be grounded, not floating
+ *      Module VCC  <---- 5V
+ *      Module GND  <---- GND
+ *
+ *      L9110 truth table:
+ *          INA=0   INB=0   -> stop
+ *          INA=PWM INB=0   -> forward, speed = duty%      <-- used here
+ *          INA=0   INB=1   -> reverse
+ *          INA=1   INB=1   -> brake
+ *
+ * -------------------------------------------------------------------------
+ * DESIGN NOTE : BLOCKING IMPLEMENTATION
+ * -------------------------------------------------------------------------
+ * The power sequence is implemented in a blocking style. While waiting for
+ * a Power-Good signal the program stays inside Wait_Power_Good(), for up to
+ * PG_TIMEOUT_MS per rail.
+ *
+ *   Benefit  : the sequence reads top-to-bottom and is easy to follow.
+ *   Drawback : the main loop is stalled during that time, so temperature
+ *              monitoring does not run while the system is booting.
+ *
+ * A non-blocking version would replace the wait loop with a switch(state)
+ * that is evaluated once per main-loop iteration, using HAL_GetTick()
+ * comparisons instead of blocking delays.
+ * =========================================================================
+ */
 
 #include "main.h"
-#include "usb_host.h"
 #include <stdio.h>
 
+/* =========================================================================
+ * Peripheral Handles
+ * =========================================================================
+ */
 I2C_HandleTypeDef hi2c1;
-I2S_HandleTypeDef hi2s3;
-SPI_HandleTypeDef hspi1;
 TIM_HandleTypeDef htim1;
 
+/* =========================================================================
+ * GPIO Definitions
+ * =========================================================================
+ */
 
-/* Private function prototypes -----------------------------------------------*/
-void SystemClock_Config(void);
-static void MX_GPIO_Init(void);
-static void MX_I2C1_Init(void);
-static void MX_I2S3_Init(void);
-static void MX_SPI1_Init(void);
-static void MX_TIM1_Init(void);
-void MX_USB_HOST_Process(void);
-/* Private user code ---------------------------------------------------------*/
-/* USER CODE BEGIN 0 */
+/* Power button */
+#define BTN_Pin             GPIO_PIN_0
+#define BTN_Port            GPIOA
 
-int _write(int file, char *ptr, int len) {
-    for (int i = 0; i < len; i++) {
-        ITM_SendChar((*ptr++));
-    }
-    return len;
-}
+/* Power-Good inputs (simulated by external jumper wires) */
+#define PG_3V3_Pin          GPIO_PIN_0
+#define PG_12V_Pin          GPIO_PIN_1
+#define PG_VCORE_Pin        GPIO_PIN_2
+#define PG_Port             GPIOB
 
-/* ==============================
- * BMC State Definition
- * ============================== */
-typedef enum {
-    STATE_STANDBY,      // Standby and waiting for power button
-    STATE_3V3_ON,       // Enable / wait for 3.3V power-good
-    STATE_12V_ON,       // Enable / wait for 12V power-good
-    STATE_VCORE_ON,     // Enable / wait for VCORE power-good
-    STATE_SYSTEM_UP,    // System boot completed
-    STATE_FAULT         // Fault protection state
-} ServerState_t;
+/* Status LEDs */
+#define LED_GREEN_Pin       GPIO_PIN_8
+#define LED_YELLOW_Pin      GPIO_PIN_10
+#define LED_RED_Pin         GPIO_PIN_12
+#define LED_Port            GPIOE
 
-/* ==============================
- * Fault Code Definition
- * ============================== */
-typedef enum {
+/* Fan PWM output is TIM1_CH1 on PE9.
+ * The pin itself is configured in HAL_TIM_MspPostInit()
+ * inside stm32f4xx_hal_msp.c.
+ */
+
+/* =========================================================================
+ * System Parameters
+ * =========================================================================
+ */
+
+/* -------------------------------------------------------------------------
+ * LM75A temperature sensor
+ *
+ * The 7-bit I2C address is 0x48.
+ * STM32 HAL expects an 8-bit address with the R/W bit position included,
+ * so the value passed to the HAL API is 0x48 << 1 = 0x90.
+ * -------------------------------------------------------------------------
+ */
+#define LM75A_ADDRESS       (0x48 << 1)
+#define LM75A_TEMP_REG      0x00
+#define I2C_TIMEOUT_MS      70
+#define I2C_RETRY_MAX       3       /* transient NACK is common on I2C;    */
+                                    /* declare a fault only after 3 fails  */
+
+/* -------------------------------------------------------------------------
+ * Power-Good timeout
+ *
+ * 若在指定時間內 PG 沒有拉高，判定該電源軌啟動失敗。
+ *
+ * 5000 ms is a demo value chosen so the Power-Good signals can be applied
+ * by hand. On a real board a point-of-load regulator is normally expected
+ * to assert Power-Good within tens of milliseconds.
+ * -------------------------------------------------------------------------
+ */
+#define PG_TIMEOUT_MS       5000
+#define RAIL_DELAY_MS       50      /* short gap between rails */
+
+/* System monitoring period */
+#define MONITOR_PERIOD_MS   1000
+
+/* -------------------------------------------------------------------------
+ * Temperature thresholds (hysteresis)
+ *
+ *   Temperature rising                Temperature falling
+ *
+ *      FAN_OFF                            FAN_HIGH
+ *         |                                  |
+ *      30.0 C  (TEMP_MID_ON)              31.0 C  (TEMP_HIGH_OFF)
+ *         v                                  v
+ *      FAN_MID                            FAN_MID
+ *         |                                  |
+ *      32.0 C  (TEMP_HIGH_ON)             28.5 C  (TEMP_MID_OFF)
+ *         v                                  v
+ *      FAN_HIGH                           FAN_OFF
+ *
+ * The ON threshold and the OFF threshold are deliberately different.
+ * The gap between them is the hysteresis band.
+ *
+ * Without it, the LM75A resolution of 0.125 C would make the reading
+ * fluctuate around a single threshold and the fan would switch state
+ * every measurement cycle.
+ *
+ * Because the decision depends on the previous fan level as well as the
+ * current temperature, a state variable (fan_level) is required.
+ *
+ * NOTE FOR DEMO:
+ *   These values must be calibrated against the ambient temperature of the
+ *   demo environment. Read the [MON ] output first, then set:
+ *       TEMP_MID_ON   = ambient + 2.0
+ *       TEMP_MID_OFF  = ambient + 0.5
+ *       TEMP_HIGH_ON  = ambient + 4.0
+ *       TEMP_HIGH_OFF = ambient + 3.0
+ *       TEMP_CRITICAL = ambient + 12.0
+ *   A fingertip is about 36 C, so TEMP_CRITICAL must stay well above it.
+ * -------------------------------------------------------------------------
+ */
+#define TEMP_MID_ON         33.0f
+#define TEMP_MID_OFF        32.0f
+#define TEMP_HIGH_ON        35.0f
+#define TEMP_HIGH_OFF       34.0f
+#define TEMP_CRITICAL       50.0f
+
+/* -------------------------------------------------------------------------
+ * Fan duty for each level
+ *
+ * A small DC motor needs a minimum duty to start from standstill.
+ * If the fan does not spin up at FAN_DUTY_MID, raise this value.
+ * -------------------------------------------------------------------------
+ */
+#define FAN_DUTY_OFF        0
+#define FAN_DUTY_MID        70
+#define FAN_DUTY_HIGH       100
+
+/* Event log depth */
+#define EVENT_LOG_SIZE      10
+
+/* =========================================================================
+ * System State
+ * =========================================================================
+ */
+typedef enum
+{
+    STATE_STANDBY = 0,
+    STATE_POWER_ON,
+    STATE_SYSTEM_UP,
+    STATE_FAULT
+} SystemState_t;
+
+/* =========================================================================
+ * Fault Code
+ * =========================================================================
+ */
+typedef enum
+{
     FAULT_NONE = 0,
     FAULT_TEMP_SENSOR,
     FAULT_OVERTEMP,
-    FAULT_3V3_PG_TIMEOUT,
-    FAULT_12V_PG_TIMEOUT,
-    FAULT_VCORE_PG_TIMEOUT
+    FAULT_3V3_TIMEOUT,
+    FAULT_12V_TIMEOUT,
+    FAULT_VCORE_TIMEOUT,
+    FAULT_INVALID_STATE
 } FaultCode_t;
 
-/* ==============================
- * Simple Event Log
- * ============================== */
-#define EVENT_LOG_SIZE 10
+/* =========================================================================
+ * Fan Level
+ * =========================================================================
+ */
+typedef enum
+{
+    FAN_OFF = 0,
+    FAN_MID,
+    FAN_HIGH
+} FanLevel_t;
 
-typedef struct {
-    uint32_t timestamp;
-    FaultCode_t fault_code;
-    ServerState_t state;
+/* =========================================================================
+ * Event Log Entry
+ * =========================================================================
+ */
+typedef struct
+{
+    uint32_t      timestamp;
+    FaultCode_t   fault;
+    SystemState_t state;
 } EventLog_t;
 
-EventLog_t event_log[EVENT_LOG_SIZE];
-uint8_t event_log_index = 0;
-
-/* ==============================
+/* =========================================================================
  * Global Variables
- * ============================== */
-uint8_t current_fan_speed = 0;
-FaultCode_t current_fault = FAULT_NONE;
-ServerState_t currentState = STATE_STANDBY;
-uint32_t state_enter_time = 0;
-uint8_t state_entry_printed = 0;
-
-#define PG_TIMEOUT_MS       3000
-#define MONITOR_PERIOD_MS   1000
-
-/* ==============================
- * Function Prototypes
- * ============================== */
-void Change_State(ServerState_t next_state);
-void Set_Fault(FaultCode_t fault);
-void Add_Event_Log(FaultCode_t fault, ServerState_t state);
-const char* Get_Fault_String(FaultCode_t fault);
-void Thermal_Management(float sys_temp);
-void Set_Fan_Speed(uint8_t speed_percent);
-float Get_System_Temperature(void);
-
-/* ==============================
- * Change State Function
- * ============================== */
-void Change_State(ServerState_t next_state) {
-    state_enter_time = HAL_GetTick();
-    state_entry_printed = 0;
-    currentState = next_state;
-}
-
-/* ==============================
- * Fault Handling Function
- * ============================== */
-void Set_Fault(FaultCode_t fault) {
-    current_fault = fault;
-    Add_Event_Log(fault, currentState);
-    Change_State(STATE_FAULT);
-}
-
-/* ==============================
- * Simple Event Log Function
- * ============================== */
-void Add_Event_Log(FaultCode_t fault, ServerState_t state) {
-    event_log[event_log_index].timestamp = HAL_GetTick();
-    event_log[event_log_index].fault_code = fault;
-    event_log[event_log_index].state = state;
-
-    event_log_index++;
-    if (event_log_index >= EVENT_LOG_SIZE) {
-        event_log_index = 0;
-    }
-}
-
-/* ==============================
- * Fault Code to String
- * ============================== */
-const char* Get_Fault_String(FaultCode_t fault) {
-    switch (fault) {
-        case FAULT_NONE:
-            return "NONE";
-        case FAULT_TEMP_SENSOR:
-            return "TEMP_SENSOR_ERROR";
-        case FAULT_OVERTEMP:
-            return "OVERTEMP";
-        case FAULT_3V3_PG_TIMEOUT:
-            return "3V3_PG_TIMEOUT";
-        case FAULT_12V_PG_TIMEOUT:
-            return "12V_PG_TIMEOUT";
-        case FAULT_VCORE_PG_TIMEOUT:
-            return "VCORE_PG_TIMEOUT";
-        default:
-            return "UNKNOWN_FAULT";
-    }
-}
-
-/* ==============================
- * PWM Fan Control
- * ============================== */
-void Set_Fan_Speed(uint8_t speed_percent) {
-    if (speed_percent > 100) {
-        speed_percent = 100;
-    }
-
-    /*
-     * 注意：
-     * 不要在這裡直接用 current_fan_speed == speed_percent 就 return。
-     * 因為系統剛啟動時，軟體變數可能是 0%，
-     * 但硬體 PWM compare value 不一定真的已經被設成停止。
-     */
-
-    if (speed_percent == 0) {
-        current_fan_speed = 0;
-        __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, 1000);  // Active-low: 1000 = stop
-        printf("[FAN] Speed set to 0%%\n");
-        return;
-    }
-
-    /*
-     * 如果不是 0%，而且軟體紀錄已經一樣，
-     * 這時才可以避免重複設定。
-     */
-    if (current_fan_speed == speed_percent) {
-        return;
-    }
-
-    current_fan_speed = speed_percent;
-
-    /*
-     * Kickstart:
-     * 如果風扇目前是停止狀態，先給短暫 100% 起轉。
-     */
-    if (__HAL_TIM_GET_COMPARE(&htim1, TIM_CHANNEL_1) == 1000) {
-        __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, 0);
-        HAL_Delay(50);
-    }
-
-    /*
-     * Deadband Mapping:
-     * 軟體 1~100% 對應到硬體 60~100%
-     */
-    uint8_t hardware_power = 60 + ((speed_percent * 40) / 100);
-
-    /*
-     * Active-low PWM:
-     * compare = 1000 代表停止
-     * compare = 0 代表全速
-     */
-    uint32_t compare_value = 1000 - (hardware_power * 10);
-    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, compare_value);
-
-    printf("[FAN] Speed set to %d%%\n", current_fan_speed);
-}
-/* ==============================
- * I2C Temperature Read
- * ============================== */
-float Get_System_Temperature(void) {
-    uint8_t temp_buffer[2];
-    int16_t raw_temp;
-    uint16_t LM75A_ADDR = 0x90;
-
-    if (HAL_I2C_Mem_Read(&hi2c1,
-                         LM75A_ADDR,
-                         0x00,
-                         I2C_MEMADD_SIZE_8BIT,
-                         temp_buffer,
-                         2,
-                         1000) == HAL_OK) {
-
-        raw_temp = (temp_buffer[0] << 8) | temp_buffer[1];
-        raw_temp = raw_temp >> 5;
-
-        return raw_temp * 0.125f;
-    }
-
-    return -999.0f;
-}
-
-/* ==============================
- * Fan Hysteresis Thermal Control
- * ==============================
- *
- * Fan Level:
- * 0: fan off
- * 1: fan 50%
- * 2: fan 100%
- *
- * Hysteresis Example:
- * - Temp >= 25C: fan 100%
- * - Temp <= 22C: fan back to 50%
- * - Temp >= 20C: fan 50%
- * - Temp <= 18C: fan off
+ * =========================================================================
  */
-void Thermal_Management(float sys_temp) {
-    static uint8_t fan_level = 0;
+SystemState_t current_state    = STATE_STANDBY;
+FaultCode_t   current_fault    = FAULT_NONE;
+FanLevel_t    fan_level        = FAN_OFF;
+uint8_t       current_fan_duty = 0;
 
-    if (sys_temp == -999.0f) {
-        Set_Fault(FAULT_TEMP_SENSOR);
+EventLog_t    event_log[EVENT_LOG_SIZE];
+uint8_t       event_log_head   = 0;   /* next write position */
+uint8_t       event_log_count  = 0;   /* number of valid entries */
+
+/* =========================================================================
+ * Function Prototypes
+ * =========================================================================
+ */
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_I2C1_Init(void);
+static void MX_TIM1_Init(void);
+
+/* Temperature */
+HAL_StatusTypeDef Read_Temperature(float *temperature);
+
+/* Fan and LED */
+void Set_Fan_Speed(uint8_t duty_percent);
+void Set_LED(FanLevel_t level);
+void Thermal_Control(float temperature);
+
+/* Power sequence */
+HAL_StatusTypeDef Wait_Power_Good(uint16_t pg_pin, uint32_t timeout_ms);
+void Power_On_Sequence(void);
+
+/* Fault handling */
+void Set_Fault(FaultCode_t fault);
+
+/* Event log */
+void Add_Event_Log(FaultCode_t fault, SystemState_t state);
+void Dump_Event_Log(void);
+
+/* Debug helpers */
+const char *Get_Fault_String(FaultCode_t fault);
+const char *Get_State_String(SystemState_t state);
+
+void Error_Handler(void);
+
+/* =========================================================================
+ * printf redirection to SWV / ITM
+ * -------------------------------------------------------------------------
+ * To print floating point values, enable
+ *   Project > Properties > C/C++ Build > Settings > MCU Settings
+ *   "Use float with printf from newlib-nano"
+ * =========================================================================
+ */
+int _write(int file, char *ptr, int len)
+{
+    (void)file;
+
+    for (int i = 0; i < len; i++)
+    {
+        ITM_SendChar(*ptr++);
+    }
+
+    return len;
+}
+
+/* =========================================================================
+ * Read LM75A Temperature
+ * -------------------------------------------------------------------------
+ * The LM75A temperature register holds 11 bits of data, left aligned:
+ *
+ *      byte0                 byte1
+ *      D15 D14 ... D8        D7 D6 D5 | x x x x x
+ *      <-------- 11 valid bits ------>  <- unused ->
+ *
+ * Steps:
+ *   1. combine the two bytes into a 16-bit value
+ *   2. shift right by 5 to extract the 11-bit value
+ *   3. multiply by 0.125 C per LSB
+ *
+ * int16_t is used so that the right shift is arithmetic, which keeps
+ * negative temperatures correct.
+ * =========================================================================
+ */
+HAL_StatusTypeDef Read_Temperature(float *temperature)
+{
+    uint8_t data[2];
+    int16_t raw;
+
+    if (temperature == NULL)
+    {
+        return HAL_ERROR;
+    }
+
+    for (uint8_t retry = 0; retry < I2C_RETRY_MAX; retry++)
+    {
+        if (HAL_I2C_Mem_Read(&hi2c1,
+                             LM75A_ADDRESS,
+                             LM75A_TEMP_REG,
+                             I2C_MEMADD_SIZE_8BIT,
+                             data,
+                             2,
+                             I2C_TIMEOUT_MS) == HAL_OK)
+        {
+            raw = (int16_t)(((uint16_t)data[0] << 8) | data[1]);
+            raw >>= 5;
+
+            *temperature = raw * 0.125f;
+
+            return HAL_OK;
+        }
+
+        HAL_Delay(5);
+    }
+
+    return HAL_ERROR;
+}
+
+/* =========================================================================
+ * Fan PWM Control
+ * -------------------------------------------------------------------------
+ * TIM1 is on APB2. The APB2 prescaler is 2, so PCLK2 = 84 MHz and the
+ * timer clock is doubled to 168 MHz.
+ *
+ *      PSC = 167   ->  counter clock = 168 MHz / 168 = 1 MHz
+ *      ARR = 999   ->  period        = 1 MHz / 1000  = 1 kHz
+ *
+ * Why 1 kHz:
+ *   The fan is a DC motor driven through an L9110 H-bridge, so the PWM
+ *   signal switches the motor supply directly. A low frequency gives
+ *   better starting torque and stays within the switching capability of
+ *   this low-cost driver IC.
+ *
+ *   A standard 4-wire PWM fan works differently: the PWM signal is a
+ *   command input to the fan's own controller while the motor is always
+ *   powered. For that type, the Intel 4-Wire PWM Controlled Fans
+ *   specification requires 21 to 28 kHz, which is above the audible range.
+ *
+ * The compare value is derived from the auto-reload register rather than
+ * a hard-coded constant, so changing the PWM frequency only requires
+ * changing MX_TIM1_Init().
+ * =========================================================================
+ */
+void Set_Fan_Speed(uint8_t duty_percent)
+{
+    uint32_t arr;
+    uint32_t compare;
+
+    if (duty_percent > 100)
+    {
+        duty_percent = 100;
+    }
+
+    /* Skip the update if the duty has not changed.
+     * This also prevents the log from being flooded once per second.
+     */
+    if (duty_percent == current_fan_duty)
+    {
         return;
     }
 
-    /*
-     * Over-temperature protection.
-     * You can adjust this value depending on your demo environment.
+    arr     = __HAL_TIM_GET_AUTORELOAD(&htim1);
+    compare = ((uint32_t)(100 - duty_percent) * (arr + 1)) / 100;
+
+    /* At 100% the compare value exceeds ARR, so the compare event never
+     * occurs and the output stays high for the whole period. This is the
+     * normal way to reach full duty in PWM mode 1.
      */
-    if (sys_temp >= 35.0f) {
+    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, compare);
+
+    current_fan_duty = duty_percent;
+
+    printf("[FAN ] Duty = %u%%\n", (unsigned)current_fan_duty);
+}
+
+/* =========================================================================
+ * Status LED
+ * -------------------------------------------------------------------------
+ *      Green   -> fan off
+ *      Yellow  -> fan mid
+ *      Red     -> fan high (and blinking in fault state)
+ * =========================================================================
+ */
+void Set_LED(FanLevel_t level)
+{
+    HAL_GPIO_WritePin(LED_Port,
+                      LED_GREEN_Pin | LED_YELLOW_Pin | LED_RED_Pin,
+                      GPIO_PIN_RESET);
+
+    switch (level)
+    {
+        case FAN_OFF:
+            HAL_GPIO_WritePin(LED_Port, LED_GREEN_Pin, GPIO_PIN_SET);
+            break;
+
+        case FAN_MID:
+            HAL_GPIO_WritePin(LED_Port, LED_YELLOW_Pin, GPIO_PIN_SET);
+            break;
+
+        case FAN_HIGH:
+            HAL_GPIO_WritePin(LED_Port, LED_RED_Pin, GPIO_PIN_SET);
+            break;
+
+        default:
+            break;
+    }
+}
+
+/* =========================================================================
+ * Thermal Management
+ * -------------------------------------------------------------------------
+ * The next fan level depends on two things:
+ *
+ *      1. the current temperature
+ *      2. the previous fan level
+ *
+ * Depending on the previous level is what creates the hysteresis:
+ * the same temperature can map to different fan levels depending on
+ * whether the temperature is rising or falling.
+ * =========================================================================
+ */
+void Thermal_Control(float temperature)
+{
+    /* --- Critical temperature protection has priority --- */
+    if (temperature >= TEMP_CRITICAL)
+    {
         Set_Fault(FAULT_OVERTEMP);
         return;
     }
 
-    switch (fan_level) {
-        case 0:
-            if (sys_temp >= 30.0f) {
-                fan_level = 1;
-            }
+    /* --- Level transitions --- */
+    if (fan_level == FAN_OFF)
+    {
+        /* Only one condition matters in this level: rising past MID_ON */
+        if (temperature >= TEMP_MID_ON)
+        {
+            fan_level = FAN_MID;
+            printf("[THRM] %.2f C >= %.1f C -> FAN MID\n",
+                   temperature, TEMP_MID_ON);
+        }
+    }
+    else if (fan_level == FAN_MID)
+    {
+        /* Rising uses HIGH_ON, falling uses MID_OFF.
+         * The two thresholds are different on purpose.
+         */
+        if (temperature >= TEMP_HIGH_ON)
+        {
+            fan_level = FAN_HIGH;
+            printf("[THRM] %.2f C >= %.1f C -> FAN HIGH\n",
+                   temperature, TEMP_HIGH_ON);
+        }
+        else if (temperature <= TEMP_MID_OFF)
+        {
+            fan_level = FAN_OFF;
+            printf("[THRM] %.2f C <= %.1f C -> FAN OFF\n",
+                   temperature, TEMP_MID_OFF);
+        }
+    }
+    else if (fan_level == FAN_HIGH)
+    {
+        /* Falls back at HIGH_OFF, which is lower than HIGH_ON */
+        if (temperature <= TEMP_HIGH_OFF)
+        {
+            fan_level = FAN_MID;
+            printf("[THRM] %.2f C <= %.1f C -> FAN MID\n",
+                   temperature, TEMP_HIGH_OFF);
+        }
+    }
+    else
+    {
+        /* Should never happen; fall back to a safe level */
+        fan_level = FAN_OFF;
+    }
+
+    /* --- Apply the level --- */
+    Set_LED(fan_level);
+
+    switch (fan_level)
+    {
+        case FAN_OFF:
+            Set_Fan_Speed(FAN_DUTY_OFF);
             break;
 
-        case 1:
-            if (sys_temp >= 32.0f) {
-                fan_level = 2;
-            }
-            else if (sys_temp <= 28.5f) {
-                fan_level = 0;
-            }
+        case FAN_MID:
+            Set_Fan_Speed(FAN_DUTY_MID);
             break;
 
-        case 2:
-            if (sys_temp <= 31.0f) {
-                fan_level = 1;
-            }
+        case FAN_HIGH:
+            Set_Fan_Speed(FAN_DUTY_HIGH);
             break;
 
         default:
-            fan_level = 0;
+            Set_Fan_Speed(FAN_DUTY_OFF);
             break;
-    }
-
-    if (fan_level == 0) {
-        HAL_GPIO_WritePin(GPIOE, GPIO_PIN_8, GPIO_PIN_SET);     // Green LED
-        HAL_GPIO_WritePin(GPIOE, GPIO_PIN_10, GPIO_PIN_RESET);
-        HAL_GPIO_WritePin(GPIOE, GPIO_PIN_12, GPIO_PIN_RESET);
-        Set_Fan_Speed(0);
-    }
-    else if (fan_level == 1) {
-        HAL_GPIO_WritePin(GPIOE, GPIO_PIN_8, GPIO_PIN_RESET);
-        HAL_GPIO_WritePin(GPIOE, GPIO_PIN_10, GPIO_PIN_SET);    // Yellow LED
-        HAL_GPIO_WritePin(GPIOE, GPIO_PIN_12, GPIO_PIN_RESET);
-        Set_Fan_Speed(50);
-    }
-    else {
-        HAL_GPIO_WritePin(GPIOE, GPIO_PIN_8, GPIO_PIN_RESET);
-        HAL_GPIO_WritePin(GPIOE, GPIO_PIN_10, GPIO_PIN_RESET);
-        HAL_GPIO_WritePin(GPIOE, GPIO_PIN_12, GPIO_PIN_SET);    // Red LED
-        Set_Fan_Speed(100);
     }
 }
 
-/* USER CODE END 0 */
+/* =========================================================================
+ * Wait for a Power-Good Signal
+ * -------------------------------------------------------------------------
+ * Waits until the selected Power-Good input goes high.
+ * Returns HAL_TIMEOUT if that does not happen within timeout_ms.
+ *
+ * This function is blocking. It is the only blocking wait in the project.
+ *
+ * The elapsed-time test uses unsigned subtraction, which is modulo 2^32,
+ * so it remains correct when HAL_GetTick() wraps after about 49.7 days.
+ * Writing it as (HAL_GetTick() >= start_time + timeout_ms) would fail
+ * at the wrap point.
+ * =========================================================================
+ */
+HAL_StatusTypeDef Wait_Power_Good(uint16_t pg_pin, uint32_t timeout_ms)
+{
+    uint32_t start_time = HAL_GetTick();
 
+    while (HAL_GPIO_ReadPin(PG_Port, pg_pin) == GPIO_PIN_RESET)
+    {
+        if ((HAL_GetTick() - start_time) >= timeout_ms)
+        {
+            return HAL_TIMEOUT;
+        }
+
+        /* Avoid polling the GPIO more often than necessary */
+        HAL_Delay(10);
+    }
+
+    return HAL_OK;
+}
+
+/* =========================================================================
+ * Power-On Sequence
+ * -------------------------------------------------------------------------
+ * Verification order:
+ *
+ *      3.3V PG  ->  12V PG  ->  VCORE PG  ->  SYSTEM UP
+ *
+ * Why this order:
+ *
+ *   1. Control power first.
+ *      3.3V supplies the management controller, the sequencing logic and
+ *      the bias of the voltage-regulator controllers. The device that
+ *      supervises the sequence has to be alive before anything else.
+ *
+ *   2. Power-tree dependency.
+ *      12V is the bulk input rail feeding every downstream regulator.
+ *      Enabling a child rail before its parent is stable makes the
+ *      regulator hiccup on under-voltage lockout.
+ *
+ *   3. Core power last.
+ *      VCORE is stepped down from 12V, and the I/O rails of the processor
+ *      must already be present. Otherwise current can flow through the
+ *      I/O ESD clamp diodes into an unpowered core rail, causing leakage
+ *      or latch-up.
+ *
+ * Staggering the rails also keeps the combined inrush current within the
+ * limits of the power supply.
+ * =========================================================================
+ */
+void Power_On_Sequence(void)
+{
+    uint32_t t_start;
+
+    current_state = STATE_POWER_ON;
+    current_fault = FAULT_NONE;
+
+    printf("\n");
+    printf("======== POWER ON SEQUENCE ========\n");
+
+    /* ---------------------------------------------------------------------
+     * Step 1 : 3.3V
+     * ---------------------------------------------------------------------
+     */
+    t_start = HAL_GetTick();
+    printf("[SEQ ] Waiting for 3.3V  PG ... ");
+
+    if (Wait_Power_Good(PG_3V3_Pin, PG_TIMEOUT_MS) != HAL_OK)
+    {
+        printf("TIMEOUT after %lu ms\n",
+               (unsigned long)(HAL_GetTick() - t_start));
+        Set_Fault(FAULT_3V3_TIMEOUT);
+        return;
+    }
+
+    printf("OK (%lu ms)\n",
+           (unsigned long)(HAL_GetTick() - t_start));
+
+    HAL_Delay(RAIL_DELAY_MS);
+
+    /* ---------------------------------------------------------------------
+     * Step 2 : 12V
+     * ---------------------------------------------------------------------
+     */
+    t_start = HAL_GetTick();
+    printf("[SEQ ] Waiting for 12V   PG ... ");
+
+    if (Wait_Power_Good(PG_12V_Pin, PG_TIMEOUT_MS) != HAL_OK)
+    {
+        printf("TIMEOUT after %lu ms\n",
+               (unsigned long)(HAL_GetTick() - t_start));
+        Set_Fault(FAULT_12V_TIMEOUT);
+        return;
+    }
+
+    printf("OK (%lu ms)\n",
+           (unsigned long)(HAL_GetTick() - t_start));
+
+    HAL_Delay(RAIL_DELAY_MS);
+
+    /* ---------------------------------------------------------------------
+     * Step 3 : VCORE
+     * ---------------------------------------------------------------------
+     */
+    t_start = HAL_GetTick();
+    printf("[SEQ ] Waiting for VCORE PG ... ");
+
+    if (Wait_Power_Good(PG_VCORE_Pin, PG_TIMEOUT_MS) != HAL_OK)
+    {
+        printf("TIMEOUT after %lu ms\n",
+               (unsigned long)(HAL_GetTick() - t_start));
+        Set_Fault(FAULT_VCORE_TIMEOUT);
+        return;
+    }
+
+    printf("OK (%lu ms)\n",
+           (unsigned long)(HAL_GetTick() - t_start));
+
+    /* ---------------------------------------------------------------------
+     * Boot completed
+     * ---------------------------------------------------------------------
+     */
+    current_state = STATE_SYSTEM_UP;
+
+    printf("======== SYSTEM UP ================\n");
+    printf("Press PA0 again to return to STANDBY.\n\n");
+}
+
+/* =========================================================================
+ * Fault Handling
+ * -------------------------------------------------------------------------
+ * Thermal fail-safe:
+ *   On over-temperature the correct action is to increase cooling, not to
+ *   stop it, so the fan is forced to 100%. Every other fault stops the fan.
+ * =========================================================================
+ */
+void Set_Fault(FaultCode_t fault)
+{
+    current_fault = fault;
+
+    /* Print the banner before taking any action so that the log reads in
+     * the correct cause-and-effect order.
+     */
+    printf("\n");
+    printf("====================================\n");
+    printf("[FAULT] %s\n", Get_Fault_String(fault));
+    printf("[STATE] %s\n", Get_State_String(current_state));
+    printf("[TIME ] %lu ms\n", (unsigned long)HAL_GetTick());
+    printf("====================================\n");
+
+    /* Record the state in which the fault actually occurred,
+     * which is why this happens before current_state is changed.
+     */
+    Add_Event_Log(fault, current_state);
+
+    if (fault == FAULT_OVERTEMP)
+    {
+        fan_level = FAN_HIGH;
+        Set_Fan_Speed(FAN_DUTY_HIGH);
+        Set_LED(FAN_HIGH);
+        printf("[SAFE ] Over-temperature -> fan forced to 100%%\n");
+    }
+    else
+    {
+        fan_level = FAN_OFF;
+        Set_Fan_Speed(FAN_DUTY_OFF);
+
+        /* Clear the LEDs; the main loop will blink the red one. */
+        HAL_GPIO_WritePin(LED_Port,
+                          LED_GREEN_Pin | LED_YELLOW_Pin | LED_RED_Pin,
+                          GPIO_PIN_RESET);
+    }
+
+    current_state = STATE_FAULT;
+
+    Dump_Event_Log();
+
+    printf("[FAULT] System latched in FAULT state.\n");
+    printf("[FAULT] Press PA0 to print the log, or reset to recover.\n\n");
+}
+
+/* =========================================================================
+ * Event Log
+ * -------------------------------------------------------------------------
+ * A circular buffer of fixed size. Once full, the oldest entry is
+ * overwritten, so the most recent EVENT_LOG_SIZE events are always kept.
+ * This mirrors the idea of the system event log kept by a management
+ * controller.
+ * =========================================================================
+ */
+void Add_Event_Log(FaultCode_t fault, SystemState_t state)
+{
+    event_log[event_log_head].timestamp = HAL_GetTick();
+    event_log[event_log_head].fault     = fault;
+    event_log[event_log_head].state     = state;
+
+    event_log_head = (event_log_head + 1) % EVENT_LOG_SIZE;
+
+    if (event_log_count < EVENT_LOG_SIZE)
+    {
+        event_log_count++;
+    }
+}
+
+void Dump_Event_Log(void)
+{
+    printf("\n-------- EVENT LOG (%u entries) --------\n",
+           (unsigned)event_log_count);
+
+    if (event_log_count == 0)
+    {
+        printf("(empty)\n");
+    }
+    else
+    {
+        uint8_t start;
+
+        /* If the buffer is not full yet, the oldest entry is at index 0.
+         * If it is full, the write head points at the oldest entry.
+         */
+        if (event_log_count == EVENT_LOG_SIZE)
+        {
+            start = event_log_head;
+        }
+        else
+        {
+            start = 0;
+        }
+
+        for (uint8_t n = 0; n < event_log_count; n++)
+        {
+            uint8_t index = (start + n) % EVENT_LOG_SIZE;
+
+            printf("[%02u] t=%8lu ms  state=%-10s  fault=%s\n",
+                   (unsigned)(n + 1),
+                   (unsigned long)event_log[index].timestamp,
+                   Get_State_String(event_log[index].state),
+                   Get_Fault_String(event_log[index].fault));
+        }
+    }
+
+    printf("---------------------------------------\n\n");
+}
+
+/* =========================================================================
+ * Fault Code to String
+ * =========================================================================
+ */
+const char *Get_Fault_String(FaultCode_t fault)
+{
+    switch (fault)
+    {
+        case FAULT_NONE:            return "NONE";
+        case FAULT_TEMP_SENSOR:     return "TEMP_SENSOR_ERROR";
+        case FAULT_OVERTEMP:        return "OVER_TEMPERATURE";
+        case FAULT_3V3_TIMEOUT:     return "3V3_PG_TIMEOUT";
+        case FAULT_12V_TIMEOUT:     return "12V_PG_TIMEOUT";
+        case FAULT_VCORE_TIMEOUT:   return "VCORE_PG_TIMEOUT";
+        case FAULT_INVALID_STATE:   return "INVALID_STATE";
+        default:                    return "UNKNOWN_FAULT";
+    }
+}
+
+/* =========================================================================
+ * System State to String
+ * =========================================================================
+ */
+const char *Get_State_String(SystemState_t state)
+{
+    switch (state)
+    {
+        case STATE_STANDBY:     return "STANDBY";
+        case STATE_POWER_ON:    return "POWER_ON";
+        case STATE_SYSTEM_UP:   return "SYSTEM_UP";
+        case STATE_FAULT:       return "FAULT";
+        default:                return "UNKNOWN_STATE";
+    }
+}
+
+
+/* =========================================================================
+ * Main
+ * =========================================================================
+ */
 int main(void)
 {
+	setvbuf(stdout, NULL, _IONBF, 0);
+    float    temperature  = 0.0f;
+    uint32_t last_monitor = 0;
+
+    /* --- Initialisation --- */
     HAL_Init();
     SystemClock_Config();
-
     MX_GPIO_Init();
     MX_I2C1_Init();
-    MX_I2S3_Init();
-    MX_SPI1_Init();
-    MX_USB_HOST_Init();
     MX_TIM1_Init();
 
-    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, 1000);  // 先確保停止
-    HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
-    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, 1000);  // 啟動後再確保一次
-    current_fan_speed = 0;
+    if (HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1) != HAL_OK)
+    {
+        Error_Handler();
+    }
 
-    uint32_t last_monitor_time = HAL_GetTick();
+    /* Make sure the fan starts stopped */
+    if (HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1) != HAL_OK)
+    {
+        Error_Handler();
+    }
+    current_fan_duty = 0xFF;
+    Set_Fan_Speed(0);
+    fan_level        = FAN_OFF;
 
-    currentState = STATE_STANDBY;
+    current_state = STATE_STANDBY;
     current_fault = FAULT_NONE;
-    state_enter_time = HAL_GetTick();
-    state_entry_printed = 0;
 
-    printf("SERVER BMC FIRMWARE INITIALIZED\n");
+    Set_LED(FAN_OFF);
+
+    printf("\n\n");
+    printf("=========================================\n");
+    printf(" STM32 POWER SEQUENCING AND THERMAL DEMO\n");
+    printf("=========================================\n");
+    printf("PG order : 3.3V -> 12V -> VCORE\n");
+    printf("State    : STANDBY\n");
+    printf("Press PA0 to start.\n\n");
+
+    /* =====================================================================
+     * Main loop
+     *
+     * Note on STATE_POWER_ON:
+     *   The power sequence is blocking, so while current_state is
+     *   STATE_POWER_ON the program is still inside Power_On_Sequence().
+     *   By the time control returns here the state is already SYSTEM_UP
+     *   or FAULT, so the main loop never observes STATE_POWER_ON and does
+     *   not need a branch for it. The state still exists because the event
+     *   log records the state in which a fault occurred.
+     * =====================================================================
+     */
+    while (1)
+    {
+        /* -----------------------------------------------------------------
+         * STATE : STANDBY
+         * -----------------------------------------------------------------
+         */
+        if (current_state == STATE_STANDBY)
+        {
+            if (HAL_GPIO_ReadPin(BTN_Port, BTN_Pin) == GPIO_PIN_SET)
+            {
+                /* Simple debounce, then wait for release so that holding
+                 * the button is not treated as repeated presses.
+                 */
+                HAL_Delay(200);
+                while (HAL_GPIO_ReadPin(BTN_Port, BTN_Pin) == GPIO_PIN_SET)
+                {
+                    HAL_Delay(10);
+                }
+
+                printf("[BTN ] Power button pressed.\n");
+
+                /* Pre-boot health check: the sensor must respond and the
+                 * temperature must be below the critical threshold.
+                 */
+                if (Read_Temperature(&temperature) != HAL_OK)
+                {
+                    printf("[CHK ] Temperature sensor error. Boot aborted.\n");
+                    Set_Fault(FAULT_TEMP_SENSOR);
+                }
+                else if (temperature >= TEMP_CRITICAL)
+                {
+                    printf("[CHK ] %.2f C is too high. Boot aborted.\n",
+                           temperature);
+                    Set_Fault(FAULT_OVERTEMP);
+                }
+                else
+                {
+                    printf("[CHK ] %.2f C OK.\n", temperature);
+
+                    Power_On_Sequence();
+
+                    /* Only arm the monitor timer if the boot succeeded.
+                     * Subtracting one period makes the first measurement
+                     * happen immediately.
+                     */
+                    if (current_state == STATE_SYSTEM_UP)
+                    {
+                        last_monitor = HAL_GetTick() - MONITOR_PERIOD_MS;
+                    }
+                }
+            }
+        }
+
+        /* -----------------------------------------------------------------
+         * STATE : SYSTEM UP
+         * -----------------------------------------------------------------
+         */
+        else if (current_state == STATE_SYSTEM_UP)
+        {
+            /* Button press returns the system to standby */
+            if (HAL_GPIO_ReadPin(BTN_Port, BTN_Pin) == GPIO_PIN_SET)
+            {
+                HAL_Delay(200);
+                while (HAL_GPIO_ReadPin(BTN_Port, BTN_Pin) == GPIO_PIN_SET)
+                {
+                    HAL_Delay(10);
+                }
+
+                printf("[BTN ] Power-off request.\n");
+
+                Set_Fan_Speed(FAN_DUTY_OFF);
+                fan_level = FAN_OFF;
+                Set_LED(FAN_OFF);
+
+                current_fault = FAULT_NONE;
+                current_state = STATE_STANDBY;
+
+                printf("[STATE] STANDBY\n");
+                printf("Press PA0 to start.\n\n");
+            }
+            /* Periodic temperature monitoring */
+            else if ((HAL_GetTick() - last_monitor) >= MONITOR_PERIOD_MS)
+            {
+                last_monitor = HAL_GetTick();
+
+                if (Read_Temperature(&temperature) != HAL_OK)
+                {
+                    Set_Fault(FAULT_TEMP_SENSOR);
+                }
+                else
+                {
+                    printf("[MON ] t=%8lu ms  TEMP=%6.2f C  "
+                           "FAN=%3u%%  LEVEL=%u\n",
+                           (unsigned long)HAL_GetTick(),
+                           temperature,
+                           (unsigned)current_fan_duty,
+                           (unsigned)fan_level);
+
+                    Thermal_Control(temperature);
+                }
+            }
+        }
+
+        /* -----------------------------------------------------------------
+         * STATE : FAULT
+         * -----------------------------------------------------------------
+         * The fault is latched. The red LED blinks and the button can be
+         * used to print the event log again. A reset is required to
+         * recover, which matches how a management controller latches a
+         * critical fault rather than silently retrying.
+         */
+        else if (current_state == STATE_FAULT)
+        {
+            HAL_GPIO_TogglePin(LED_Port, LED_RED_Pin);
+            HAL_Delay(200);
+
+            if (HAL_GPIO_ReadPin(BTN_Port, BTN_Pin) == GPIO_PIN_SET)
+            {
+                HAL_Delay(200);
+                while (HAL_GPIO_ReadPin(BTN_Port, BTN_Pin) == GPIO_PIN_SET)
+                {
+                    HAL_Delay(10);
+                }
+
+                Dump_Event_Log();
+            }
+        }
+
+        /* -----------------------------------------------------------------
+         * Unexpected state
+         * -----------------------------------------------------------------
+         */
+        else
+        {
+            Set_Fault(FAULT_INVALID_STATE);
+        }
+    }
+}
+
+/* =========================================================================
+ * System Clock Configuration
+ * -------------------------------------------------------------------------
+ *      HSE     = 8 MHz
+ *      PLLM    = 8         ->  8 MHz / 8   = 1 MHz
+ *      PLLN    = 336       ->  1 MHz * 336 = 336 MHz
+ *      PLLP    = 2         ->  336 / 2     = 168 MHz  (SYSCLK)
+ *
+ *      HCLK    = 168 MHz
+ *      APB1    = 42 MHz
+ *      APB2    = 84 MHz    ->  TIM1 clock  = 168 MHz
+ * =========================================================================
+ */
+void SystemClock_Config(void)
+{
+    RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+    RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+    __HAL_RCC_PWR_CLK_ENABLE();
+    __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
+
+    RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+    RCC_OscInitStruct.HSEState       = RCC_HSE_ON;
+    RCC_OscInitStruct.PLL.PLLState   = RCC_PLL_ON;
+    RCC_OscInitStruct.PLL.PLLSource  = RCC_PLLSOURCE_HSE;
+    RCC_OscInitStruct.PLL.PLLM       = 8;
+    RCC_OscInitStruct.PLL.PLLN       = 336;
+    RCC_OscInitStruct.PLL.PLLP       = RCC_PLLP_DIV2;
+    RCC_OscInitStruct.PLL.PLLQ       = 7;
+
+    if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+    {
+        Error_Handler();
+    }
+
+    RCC_ClkInitStruct.ClockType      = RCC_CLOCKTYPE_HCLK
+                                     | RCC_CLOCKTYPE_SYSCLK
+                                     | RCC_CLOCKTYPE_PCLK1
+                                     | RCC_CLOCKTYPE_PCLK2;
+    RCC_ClkInitStruct.SYSCLKSource   = RCC_SYSCLKSOURCE_PLLCLK;
+    RCC_ClkInitStruct.AHBCLKDivider  = RCC_SYSCLK_DIV1;
+    RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV4;
+    RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV2;
+
+    if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_5) != HAL_OK)
+    {
+        Error_Handler();
+    }
+}
+
+/* =========================================================================
+ * I2C1 Initialisation
+ * =========================================================================
+ */
+static void MX_I2C1_Init(void)
+{
+    hi2c1.Instance             = I2C1;
+    hi2c1.Init.ClockSpeed      = 100000;
+    hi2c1.Init.DutyCycle       = I2C_DUTYCYCLE_2;
+    hi2c1.Init.OwnAddress1     = 0;
+    hi2c1.Init.AddressingMode  = I2C_ADDRESSINGMODE_7BIT;
+    hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+    hi2c1.Init.OwnAddress2     = 0;
+    hi2c1.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+    hi2c1.Init.NoStretchMode   = I2C_NOSTRETCH_DISABLE;
+
+    if (HAL_I2C_Init(&hi2c1) != HAL_OK)
+    {
+        Error_Handler();
+    }
+}
+
+/* =========================================================================
+ * TIM1 PWM Initialisation
+ * -------------------------------------------------------------------------
+ *      TIM1 clock = 168 MHz
+ *      PSC        = 167    ->  counter clock = 1 MHz
+ *      ARR        = 999    ->  PWM frequency = 1 kHz
+ *
+ * If these values are changed, update the .ioc file as well, otherwise
+ * regenerating code from CubeMX will overwrite them.
+ * =========================================================================
+ */
+static void MX_TIM1_Init(void)
+{
+    TIM_MasterConfigTypeDef        sMasterConfig        = {0};
+    TIM_OC_InitTypeDef             sConfigOC            = {0};
+    TIM_BreakDeadTimeConfigTypeDef sBreakDeadTimeConfig = {0};
+
+    htim1.Instance               = TIM1;
+    htim1.Init.Prescaler         = 167;
+    htim1.Init.CounterMode       = TIM_COUNTERMODE_UP;
+    htim1.Init.Period            = 999;
+    htim1.Init.ClockDivision     = TIM_CLOCKDIVISION_DIV1;
+    htim1.Init.RepetitionCounter = 0;
+    htim1.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+
+    if (HAL_TIM_PWM_Init(&htim1) != HAL_OK)
+    {
+        Error_Handler();
+    }
+
+    sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+    sMasterConfig.MasterSlaveMode     = TIM_MASTERSLAVEMODE_DISABLE;
+
+    if (HAL_TIMEx_MasterConfigSynchronization(&htim1, &sMasterConfig) != HAL_OK)
+    {
+        Error_Handler();
+    }
+
+    sConfigOC.OCMode       = TIM_OCMODE_PWM1;
+    sConfigOC.Pulse        = 0;
+    sConfigOC.OCPolarity   = TIM_OCPOLARITY_HIGH;
+    sConfigOC.OCNPolarity  = TIM_OCNPOLARITY_HIGH;
+    sConfigOC.OCFastMode   = TIM_OCFAST_DISABLE;
+    sConfigOC.OCIdleState  = TIM_OCIDLESTATE_RESET;
+    sConfigOC.OCNIdleState = TIM_OCNIDLESTATE_RESET;
+
+    if (HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
+    {
+        Error_Handler();
+    }
+
+    sBreakDeadTimeConfig.OffStateRunMode  = TIM_OSSR_DISABLE;
+    sBreakDeadTimeConfig.OffStateIDLEMode = TIM_OSSI_DISABLE;
+    sBreakDeadTimeConfig.LockLevel        = TIM_LOCKLEVEL_OFF;
+    sBreakDeadTimeConfig.DeadTime         = 0;
+    sBreakDeadTimeConfig.BreakState       = TIM_BREAK_DISABLE;
+    sBreakDeadTimeConfig.BreakPolarity    = TIM_BREAKPOLARITY_HIGH;
+    sBreakDeadTimeConfig.AutomaticOutput  = TIM_AUTOMATICOUTPUT_DISABLE;
+
+    if (HAL_TIMEx_ConfigBreakDeadTime(&htim1, &sBreakDeadTimeConfig) != HAL_OK)
+    {
+        Error_Handler();
+    }
+
+    /* Configures TIM1_CH1 on PE9. The pin setup lives in
+     * stm32f4xx_hal_msp.c and is generated by CubeMX.
+     */
+    HAL_TIM_MspPostInit(&htim1);
+}
+
+/* =========================================================================
+ * GPIO Initialisation
+ * =========================================================================
+ */
+static void MX_GPIO_Init(void)
+{
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+    __HAL_RCC_GPIOB_CLK_ENABLE();
+    __HAL_RCC_GPIOE_CLK_ENABLE();
+
+    /* --- Status LEDs, all off initially --- */
+    HAL_GPIO_WritePin(LED_Port,
+                      LED_GREEN_Pin | LED_YELLOW_Pin | LED_RED_Pin,
+                      GPIO_PIN_RESET);
+
+    GPIO_InitStruct.Pin   = LED_GREEN_Pin | LED_YELLOW_Pin | LED_RED_Pin;
+    GPIO_InitStruct.Mode  = GPIO_MODE_OUTPUT_PP;
+    GPIO_InitStruct.Pull  = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(LED_Port, &GPIO_InitStruct);
+
+    /* --- Power button on PA0 ---
+     * The Discovery board already has an external pull-down on this pin,
+     * so no internal pull is required. Use GPIO_PULLDOWN if the button
+     * is replaced by an external one without a pull-down.
+     */
+    GPIO_InitStruct.Pin  = BTN_Pin;
+    GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    HAL_GPIO_Init(BTN_Port, &GPIO_InitStruct);
+
+    /* --- Power-Good inputs on PB0 / PB1 / PB2 ---
+     * An internal pull-down gives a safe default: a disconnected input
+     * reads low, which is interpreted as "not ready" rather than "good".
+     * A lost signal should never look like a healthy rail.
+     */
+    GPIO_InitStruct.Pin  = PG_3V3_Pin | PG_12V_Pin | PG_VCORE_Pin;
+    GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+    GPIO_InitStruct.Pull = GPIO_PULLDOWN;
+    HAL_GPIO_Init(PG_Port, &GPIO_InitStruct);
+}
+
+/* =========================================================================
+ * Error Handler
+ * =========================================================================
+ */
+void Error_Handler(void)
+{
+    __disable_irq();
 
     while (1)
     {
-        MX_USB_HOST_Process();
-
-        /*
-         * ==============================
-         * Task A: Periodic Monitor
-         * ==============================
-         * Runs every 1 second.
-         * This task will still run during power sequencing,
-         * because the state machine is now non-blocking.
-         */
-        if (HAL_GetTick() - last_monitor_time >= MONITOR_PERIOD_MS) {
-            last_monitor_time = HAL_GetTick();
-
-            float sys_temp = Get_System_Temperature();
-
-            if (sys_temp != -999.0f) {
-                printf("[MONITOR], STATE:%d, TEMP:%.3f, FAN:%d%%, FAULT:%s\n",
-                       currentState,
-                       sys_temp,
-                       current_fan_speed,
-                       Get_Fault_String(current_fault));
-            }
-            else {
-                printf("[MONITOR], STATE:%d, TEMP:ERROR, FAN:%d%%, FAULT:%s\n",
-                       currentState,
-                       current_fan_speed,
-                       Get_Fault_String(current_fault));
-            }
-
-            /*
-             * Thermal management only works after system is fully up.
-             */
-            if (currentState == STATE_SYSTEM_UP) {
-                Thermal_Management(sys_temp);
-            }
-        }
-
-        /*
-         * ==============================
-         * Task B: Non-blocking State Machine
-         * ==============================
-         */
-        switch (currentState) {
-
-            case STATE_STANDBY:
-            {
-                if (!state_entry_printed) {
-                    printf("[STATE] STANDBY. Press PA0 to start boot sequence.\n");
-                    state_entry_printed = 1;
-                }
-
-                /*
-                 * Wait for power button.
-                 */
-                if (HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_0) == GPIO_PIN_SET) {
-                    float check_temp = Get_System_Temperature();
-
-                    if (check_temp == -999.0f) {
-                        printf("[REJECT] Temperature sensor error. Boot aborted.\n");
-                        Set_Fault(FAULT_TEMP_SENSOR);
-                    }
-                    else if (check_temp >= 35.0f) {
-                        printf("[REJECT] Over-temperature %.3f C. Boot aborted.\n", check_temp);
-                        Set_Fault(FAULT_OVERTEMP);
-                    }
-                    else {
-                        printf("[CMD] Button Pressed. Temp OK %.3f C. Booting...\n", check_temp);
-                        current_fault = FAULT_NONE;
-                        Change_State(STATE_3V3_ON);
-                    }
-
-                    /*
-                     * Short delay only for button debounce.
-                     * This is acceptable because it is short.
-                     */
-                    HAL_Delay(200);
-                }
-                break;
-            }
-
-            case STATE_3V3_ON:
-            {
-                if (!state_entry_printed) {
-                    printf("[SEQ] 3.3V Enabled. Waiting for PG on PB0...\n");
-                    state_entry_printed = 1;
-                }
-
-                /*
-                 * If PB0 goes high before timeout, go to next rail.
-                 */
-                if (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_0) == GPIO_PIN_SET) {
-                    printf("[SEQ] 3.3V PG OK.\n");
-                    Change_State(STATE_12V_ON);
-                }
-                /*
-                 * If timeout occurs, enter fault state.
-                 */
-                else if (HAL_GetTick() - state_enter_time >= PG_TIMEOUT_MS) {
-                    printf("[FAULT] 3.3V PG timeout.\n");
-                    Set_Fault(FAULT_3V3_PG_TIMEOUT);
-                }
-                break;
-            }
-
-            case STATE_12V_ON:
-            {
-                if (!state_entry_printed) {
-                    printf("[SEQ] 12V Enabled. Waiting for PG on PB1...\n");
-                    state_entry_printed = 1;
-                }
-
-                if (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_1) == GPIO_PIN_SET) {
-                    printf("[SEQ] 12V PG OK.\n");
-                    Change_State(STATE_VCORE_ON);
-                }
-                else if (HAL_GetTick() - state_enter_time >= PG_TIMEOUT_MS) {
-                    printf("[FAULT] 12V PG timeout.\n");
-                    Set_Fault(FAULT_12V_PG_TIMEOUT);
-                }
-                break;
-            }
-
-            case STATE_VCORE_ON:
-            {
-                if (!state_entry_printed) {
-                    printf("[SEQ] VCORE Enabled. Waiting for PG on PB2...\n");
-                    state_entry_printed = 1;
-                }
-
-                if (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_2) == GPIO_PIN_SET) {
-                    printf("[SEQ] VCORE PG OK.\n");
-                    printf(">>> SYSTEM FULLY UP. THERMAL MANAGEMENT ENABLED. <<<\n");
-                    Change_State(STATE_SYSTEM_UP);
-                }
-                else if (HAL_GetTick() - state_enter_time >= PG_TIMEOUT_MS) {
-                    printf("[FAULT] VCORE PG timeout.\n");
-                    Set_Fault(FAULT_VCORE_PG_TIMEOUT);
-                }
-                break;
-            }
-
-            case STATE_SYSTEM_UP:
-            {
-                if (!state_entry_printed) {
-                    printf("[STATE] SYSTEM_UP. Sensor monitoring and fan control active.\n");
-                    state_entry_printed = 1;
-                }
-
-                /*
-                 * Thermal management is handled by Task A every 1 second.
-                 */
-                break;
-            }
-
-            case STATE_FAULT:
-            {
-                if (!state_entry_printed) {
-                    printf("[ALARM] FATAL ERROR. FAULT CODE: %s\n",
-                           Get_Fault_String(current_fault));
-
-                    HAL_GPIO_WritePin(GPIOE, GPIO_PIN_8, GPIO_PIN_RESET);
-                    HAL_GPIO_WritePin(GPIOE, GPIO_PIN_10, GPIO_PIN_RESET);
-                    HAL_GPIO_WritePin(GPIOE, GPIO_PIN_12, GPIO_PIN_RESET);
-
-                    Set_Fan_Speed(0);
-
-                    printf("[EVENT LOG] Latest fault saved. System halted.\n");
-
-                    state_entry_printed = 1;
-                }
-
-                /*
-                 * Stay in fault state.
-                 * You can reset the board to recover.
-                 */
-                break;
-            }
-
-            default:
-            {
-                Set_Fault(FAULT_NONE);
-                break;
-            }
-        }
+        /* Fatal initialisation error. Stay here until reset. */
     }
 }
 
-void SystemClock_Config(void)
-{
-  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
-  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
-  RCC_PeriphCLKInitTypeDef PeriphClkInitStruct = {0};
-
-  /** Configure the main internal regulator output voltage 
-  */
-  __HAL_RCC_PWR_CLK_ENABLE();
-  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
-  /** Initializes the CPU, AHB and APB busses clocks 
-  */
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
-  RCC_OscInitStruct.HSEState = RCC_HSE_ON;
-  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
-  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
-  RCC_OscInitStruct.PLL.PLLM = 8;
-  RCC_OscInitStruct.PLL.PLLN = 336;
-  RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
-  RCC_OscInitStruct.PLL.PLLQ = 7;
-  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /** Initializes the CPU, AHB and APB busses clocks 
-  */
-  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
-                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
-  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
-  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
-  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV4;
-  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV2;
-
-  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_5) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  PeriphClkInitStruct.PeriphClockSelection = RCC_PERIPHCLK_I2S;
-  PeriphClkInitStruct.PLLI2S.PLLI2SN = 192;
-  PeriphClkInitStruct.PLLI2S.PLLI2SR = 2;
-  if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInitStruct) != HAL_OK)
-  {
-    Error_Handler();
-  }
-}
-
-/**
-  * @brief I2C1 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_I2C1_Init(void)
-{
-
-  /* USER CODE BEGIN I2C1_Init 0 */
-
-  /* USER CODE END I2C1_Init 0 */
-
-  /* USER CODE BEGIN I2C1_Init 1 */
-
-  /* USER CODE END I2C1_Init 1 */
-  hi2c1.Instance = I2C1;
-  hi2c1.Init.ClockSpeed = 100000;
-  hi2c1.Init.DutyCycle = I2C_DUTYCYCLE_2;
-  hi2c1.Init.OwnAddress1 = 0;
-  hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
-  hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
-  hi2c1.Init.OwnAddress2 = 0;
-  hi2c1.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
-  hi2c1.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
-  if (HAL_I2C_Init(&hi2c1) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN I2C1_Init 2 */
-
-  /* USER CODE END I2C1_Init 2 */
-
-}
-
-/**
-  * @brief I2S3 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_I2S3_Init(void)
-{
-
-  /* USER CODE BEGIN I2S3_Init 0 */
-
-  /* USER CODE END I2S3_Init 0 */
-
-  /* USER CODE BEGIN I2S3_Init 1 */
-
-  /* USER CODE END I2S3_Init 1 */
-  hi2s3.Instance = SPI3;
-  hi2s3.Init.Mode = I2S_MODE_MASTER_TX;
-  hi2s3.Init.Standard = I2S_STANDARD_PHILIPS;
-  hi2s3.Init.DataFormat = I2S_DATAFORMAT_16B;
-  hi2s3.Init.MCLKOutput = I2S_MCLKOUTPUT_ENABLE;
-  hi2s3.Init.AudioFreq = I2S_AUDIOFREQ_96K;
-  hi2s3.Init.CPOL = I2S_CPOL_LOW;
-  hi2s3.Init.ClockSource = I2S_CLOCK_PLL;
-  hi2s3.Init.FullDuplexMode = I2S_FULLDUPLEXMODE_DISABLE;
-  if (HAL_I2S_Init(&hi2s3) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN I2S3_Init 2 */
-
-  /* USER CODE END I2S3_Init 2 */
-
-}
-
-/**
-  * @brief SPI1 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_SPI1_Init(void)
-{
-
-  /* USER CODE BEGIN SPI1_Init 0 */
-
-  /* USER CODE END SPI1_Init 0 */
-
-  /* USER CODE BEGIN SPI1_Init 1 */
-
-  /* USER CODE END SPI1_Init 1 */
-  /* SPI1 parameter configuration*/
-  hspi1.Instance = SPI1;
-  hspi1.Init.Mode = SPI_MODE_MASTER;
-  hspi1.Init.Direction = SPI_DIRECTION_2LINES;
-  hspi1.Init.DataSize = SPI_DATASIZE_8BIT;
-  hspi1.Init.CLKPolarity = SPI_POLARITY_LOW;
-  hspi1.Init.CLKPhase = SPI_PHASE_1EDGE;
-  hspi1.Init.NSS = SPI_NSS_SOFT;
-  hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_2;
-  hspi1.Init.FirstBit = SPI_FIRSTBIT_MSB;
-  hspi1.Init.TIMode = SPI_TIMODE_DISABLE;
-  hspi1.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
-  hspi1.Init.CRCPolynomial = 10;
-  if (HAL_SPI_Init(&hspi1) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN SPI1_Init 2 */
-
-  /* USER CODE END SPI1_Init 2 */
-
-}
-
-/**
-  * @brief TIM1 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_TIM1_Init(void)
-{
-
-  /* USER CODE BEGIN TIM1_Init 0 */
-
-  /* USER CODE END TIM1_Init 0 */
-
-  TIM_MasterConfigTypeDef sMasterConfig = {0};
-  TIM_OC_InitTypeDef sConfigOC = {0};
-  TIM_BreakDeadTimeConfigTypeDef sBreakDeadTimeConfig = {0};
-
-  /* USER CODE BEGIN TIM1_Init 1 */
-
-  /* USER CODE END TIM1_Init 1 */
-  htim1.Instance = TIM1;
-  htim1.Init.Prescaler = 167;
-  htim1.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim1.Init.Period = 999;
-  htim1.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
-  htim1.Init.RepetitionCounter = 0;
-  htim1.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
-  if (HAL_TIM_PWM_Init(&htim1) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
-  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
-  if (HAL_TIMEx_MasterConfigSynchronization(&htim1, &sMasterConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sConfigOC.OCMode = TIM_OCMODE_PWM1;
-  sConfigOC.Pulse = 0;
-  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
-  sConfigOC.OCNPolarity = TIM_OCNPOLARITY_HIGH;
-  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
-  sConfigOC.OCIdleState = TIM_OCIDLESTATE_RESET;
-  sConfigOC.OCNIdleState = TIM_OCNIDLESTATE_RESET;
-  if (HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sBreakDeadTimeConfig.OffStateRunMode = TIM_OSSR_DISABLE;
-  sBreakDeadTimeConfig.OffStateIDLEMode = TIM_OSSI_DISABLE;
-  sBreakDeadTimeConfig.LockLevel = TIM_LOCKLEVEL_OFF;
-  sBreakDeadTimeConfig.DeadTime = 0;
-  sBreakDeadTimeConfig.BreakState = TIM_BREAK_DISABLE;
-  sBreakDeadTimeConfig.BreakPolarity = TIM_BREAKPOLARITY_HIGH;
-  sBreakDeadTimeConfig.AutomaticOutput = TIM_AUTOMATICOUTPUT_DISABLE;
-  if (HAL_TIMEx_ConfigBreakDeadTime(&htim1, &sBreakDeadTimeConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN TIM1_Init 2 */
-
-  /* USER CODE END TIM1_Init 2 */
-  HAL_TIM_MspPostInit(&htim1);
-
-}
-
-/**
-  * @brief GPIO Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_GPIO_Init(void)
-{
-  GPIO_InitTypeDef GPIO_InitStruct = {0};
-
-  /* GPIO Ports Clock Enable */
-  __HAL_RCC_GPIOE_CLK_ENABLE();
-  __HAL_RCC_GPIOC_CLK_ENABLE();
-  __HAL_RCC_GPIOH_CLK_ENABLE();
-  __HAL_RCC_GPIOA_CLK_ENABLE();
-  __HAL_RCC_GPIOB_CLK_ENABLE();
-  __HAL_RCC_GPIOD_CLK_ENABLE();
-
-  /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOE, CS_I2C_SPI_Pin|GPIO_PIN_8|GPIO_PIN_10|GPIO_PIN_12, GPIO_PIN_RESET);
-
-  /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(OTG_FS_PowerSwitchOn_GPIO_Port, OTG_FS_PowerSwitchOn_Pin, GPIO_PIN_SET);
-
-  /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOD, LD4_Pin|LD3_Pin|LD5_Pin|LD6_Pin 
-                          |Audio_RST_Pin, GPIO_PIN_RESET);
-
-  /*Configure GPIO pins : CS_I2C_SPI_Pin PE8 PE10 PE12 */
-  GPIO_InitStruct.Pin = CS_I2C_SPI_Pin|GPIO_PIN_8|GPIO_PIN_10|GPIO_PIN_12;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
-
-  /*Configure GPIO pin : OTG_FS_PowerSwitchOn_Pin */
-  GPIO_InitStruct.Pin = OTG_FS_PowerSwitchOn_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(OTG_FS_PowerSwitchOn_GPIO_Port, &GPIO_InitStruct);
-
-  /*Configure GPIO pin : PDM_OUT_Pin */
-  GPIO_InitStruct.Pin = PDM_OUT_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  GPIO_InitStruct.Alternate = GPIO_AF5_SPI2;
-  HAL_GPIO_Init(PDM_OUT_GPIO_Port, &GPIO_InitStruct);
-
-  /*Configure GPIO pin : PA0 */
-  GPIO_InitStruct.Pin = GPIO_PIN_0;
-  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
-
-  /*Configure GPIO pins : PB0 PB1 PB2 */
-  GPIO_InitStruct.Pin = GPIO_PIN_0|GPIO_PIN_1|GPIO_PIN_2;
-  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-  GPIO_InitStruct.Pull = GPIO_PULLDOWN;
-  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
-
-  /*Configure GPIO pin : CLK_IN_Pin */
-  GPIO_InitStruct.Pin = CLK_IN_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  GPIO_InitStruct.Alternate = GPIO_AF5_SPI2;
-  HAL_GPIO_Init(CLK_IN_GPIO_Port, &GPIO_InitStruct);
-
-  /*Configure GPIO pins : LD4_Pin LD3_Pin LD5_Pin LD6_Pin 
-                           Audio_RST_Pin */
-  GPIO_InitStruct.Pin = LD4_Pin|LD3_Pin|LD5_Pin|LD6_Pin 
-                          |Audio_RST_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(GPIOD, &GPIO_InitStruct);
-
-  /*Configure GPIO pin : OTG_FS_OverCurrent_Pin */
-  GPIO_InitStruct.Pin = OTG_FS_OverCurrent_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  HAL_GPIO_Init(OTG_FS_OverCurrent_GPIO_Port, &GPIO_InitStruct);
-
-  /*Configure GPIO pin : MEMS_INT2_Pin */
-  GPIO_InitStruct.Pin = MEMS_INT2_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_EVT_RISING;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  HAL_GPIO_Init(MEMS_INT2_GPIO_Port, &GPIO_InitStruct);
-
-}
-
-/* USER CODE BEGIN 4 */
-
-/* USER CODE END 4 */
-
-/**
-  * @brief  This function is executed in case of error occurrence.
-  * @retval None
-  */
-void Error_Handler(void)
-{
-  /* USER CODE BEGIN Error_Handler_Debug */
-  /* User can add his own implementation to report the HAL error return state */
-
-  /* USER CODE END Error_Handler_Debug */
-}
-
-#ifdef  USE_FULL_ASSERT
-/**
-  * @brief  Reports the name of the source file and the source line number
-  *         where the assert_param error has occurred.
-  * @param  file: pointer to the source file name
-  * @param  line: assert_param error line source number
-  * @retval None
-  */
+/* =========================================================================
+ * Assert Handler
+ * =========================================================================
+ */
+#ifdef USE_FULL_ASSERT
 void assert_failed(uint8_t *file, uint32_t line)
-{ 
-  /* USER CODE BEGIN 6 */
-  /* User can add his own implementation to report the file name and line number,
-     tex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
-  /* USER CODE END 6 */
+{
+    printf("[ASSERT] %s : %lu\n", (char *)file, (unsigned long)line);
 }
-#endif /* USE_FULL_ASSERT */
-
-/************************ (C) COPYRIGHT STMicroelectronics *****END OF FILE****/
+#endif
